@@ -1,0 +1,10 @@
+PLACEHOLDER — Reemplaza este archivo con el que obtienes de PayPal.
+
+Para obtenerlo:
+1. Ve a tu cuenta PayPal Business → Settings → Website Payments → Apple Pay
+2. Registra tu dominio
+3. PayPal generará este archivo con el contenido correcto
+4. Colócalo en: /.well-known/apple-developer-merchantid-domain-association
+5. Asegúrate de que sea accesible públicamente via HTTPS sin redirección
+
+Documentación: https://developer.paypal.com/docs/checkout/apm/apple-pay/
