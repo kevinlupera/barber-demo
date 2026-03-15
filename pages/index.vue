@@ -5,12 +5,12 @@ const paymentStatus = ref<'idle' | 'processing' | 'success' | 'error'>('idle')
 const errorMessage = ref('')
 
 // ─── Carga SDK solo en el cliente para evitar error SSR/hydration ──────────
+// enable-funding=applepay: permite que PayPal renderice el botón de Apple Pay
 function loadPayPalScript(): Promise<void> {
   return new Promise((resolve, reject) => {
     if ((window as any).paypal) return resolve()
     const script = document.createElement('script')
-    // components=buttons,applepay: carga la Buttons API y la Applepay() API
-    script.src = `https://www.paypal.com/sdk/js?client-id=${config.public.paypalClientId}&currency=USD&components=buttons,applepay`
+    script.src = `https://www.paypal.com/sdk/js?client-id=${config.public.paypalClientId}&currency=USD&components=buttons&enable-funding=applepay`
     script.crossOrigin = 'anonymous'
     script.onload = () => resolve()
     script.onerror = () => reject(new Error('No se pudo cargar el SDK de PayPal'))
@@ -44,96 +44,13 @@ async function captureOrder(orderId: string): Promise<void> {
   }
 }
 
-// ─── Apple Pay vía PayPal Applepay() API ───────────────────────────────────
-// Usamos este approach en vez de paypal.FUNDING.APPLEPAY porque nos da control
-// total sobre el botón visual (siempre visible) y el flujo de la sesión
+// ─── Renderizar botones via PayPal SDK ─────────────────────────────────────
 
-async function handleApplePayClick() {
-  const win = window as any
-  errorMessage.value = ''
-
-  // 1. Verificar soporte del navegador
-  if (!win.ApplePaySession || !win.ApplePaySession.canMakePayments()) {
-    errorMessage.value = 'Apple Pay requiere Safari en un dispositivo Apple con Apple Pay configurado.'
-    return
-  }
-
-  const paypal = win.paypal
-  if (!paypal?.Applepay) {
-    errorMessage.value = 'El componente Apple Pay de PayPal no está disponible.'
-    return
-  }
-
-  try {
-    const applepay = paypal.Applepay()
-    const appleConfig = await applepay.config()
-
-    // 2. Verificar elegibilidad con PayPal
-    if (!appleConfig.isEligible) {
-      errorMessage.value = 'Apple Pay no está habilitado en esta cuenta de PayPal.'
-      return
-    }
-
-    // 3. Crear sesión de Apple Pay con los parámetros que regresa PayPal
-    const session = new win.ApplePaySession(4, {
-      countryCode: appleConfig.countryCode || 'US',
-      currencyCode: 'USD',
-      merchantCapabilities: appleConfig.merchantCapabilities,
-      supportedNetworks: appleConfig.supportedNetworks,
-      total: { label: 'The Barber', type: 'final', amount: '25.00' }
-    })
-
-    // 4. Validación del merchant (requerida por Apple)
-    session.onvalidatemerchant = async (event: any) => {
-      try {
-        const { merchantSession } = await applepay.validateMerchant({
-          validationUrl: event.validationURL,
-          displayName: 'The Barber'
-        })
-        session.completeMerchantValidation(merchantSession)
-      } catch {
-        session.abort()
-        errorMessage.value = 'Error validando merchant. Verifica el archivo de dominio de Apple Pay.'
-      }
-    }
-
-    // 5. Usuario autorizó el pago en el sheet de Apple Pay
-    session.onpaymentauthorized = async (event: any) => {
-      try {
-        const orderId = await createOrder()
-
-        // Confirmar con PayPal usando el token de Apple Pay
-        await applepay.confirmOrder({
-          orderId,
-          token: event.payment.token,
-          billingContact: event.payment.billingContact,
-          shippingContact: event.payment.shippingContact
-        })
-
-        await captureOrder(orderId)
-        session.completePayment(win.ApplePaySession.STATUS_SUCCESS)
-      } catch {
-        session.completePayment(win.ApplePaySession.STATUS_FAILURE)
-        paymentStatus.value = 'error'
-        errorMessage.value = 'Error al procesar el pago con Apple Pay.'
-      }
-    }
-
-    session.oncancel = () => { paymentStatus.value = 'idle' }
-
-    session.begin()
-  } catch {
-    errorMessage.value = 'No se pudo iniciar Apple Pay. Asegúrate de estar en Safari con Apple Pay configurado.'
-  }
-}
-
-// ─── Botón PayPal estándar ─────────────────────────────────────────────────
-
-function renderPayPalButton() {
+function renderPaymentButtons() {
   const paypal = (window as any).paypal
   if (!paypal) return
 
-  paypal.Buttons({
+  const sharedConfig = {
     createOrder,
     onApprove: (data: { orderID: string }) => captureOrder(data.orderID),
     onError: () => {
@@ -143,7 +60,26 @@ function renderPayPalButton() {
     onCancel: () => {
       paymentStatus.value = 'idle'
       errorMessage.value = ''
-    },
+    }
+  }
+
+  // ─── Apple Pay — PayPal lo renderiza y controla la elegibilidad ───────────
+  // Solo aparece en Safari con Apple Pay configurado y dominio verificado en PayPal
+  const applePayBtn = paypal.Buttons({
+    ...sharedConfig,
+    fundingSource: paypal.FUNDING.APPLEPAY
+  })
+
+  if (applePayBtn.isEligible()) {
+    applePayBtn.render('#apple-pay-container')
+  } else {
+    const section = document.getElementById('apple-pay-section')
+    if (section) section.style.display = 'none'
+  }
+
+  // ─── PayPal estándar ──────────────────────────────────────────────────────
+  paypal.Buttons({
+    ...sharedConfig,
     fundingSource: paypal.FUNDING.PAYPAL,
     style: { layout: 'vertical', color: 'gold', shape: 'rect', label: 'pay', tagline: false }
   }).render('#paypal-button-container')
@@ -152,7 +88,7 @@ function renderPayPalButton() {
 onMounted(async () => {
   try {
     await loadPayPalScript()
-    renderPayPalButton()
+    renderPaymentButtons()
   } catch {
     errorMessage.value = 'No se pudo cargar el módulo de pagos. Recarga la página.'
   }
@@ -242,17 +178,9 @@ onMounted(async () => {
         <section class="payment-card">
           <p class="payment-heading">Método de pago</p>
 
-          <!-- Apple Pay — botón siempre visible, pago vía PayPal Applepay() API -->
-          <!-- En Safari: renderiza el botón nativo de Apple Pay con CSS -->
-          <!-- En otros navegadores: muestra botón negro con logo Apple como fallback -->
-          <div class="payment-block">
-            <button class="apple-pay-btn" @click="handleApplePayClick">
-              <!-- Solo visible en navegadores sin soporte para -webkit-appearance: -apple-pay-button -->
-              <svg viewBox="0 0 814 1000" fill="currentColor" class="apple-btn-logo">
-                <path d="M788.1 340.9c-5.8 4.5-108.2 62.2-108.2 190.5 0 148.4 130.3 200.9 134.2 202.2-.6 3.2-20.7 71.9-68.7 141.9-42.8 61.6-87.5 123.1-155.5 123.1s-85.5-39.5-164-39.5c-76 0-103.7 40.8-165.9 40.8s-105-57.8-155.5-127.4C46 790.7 0 663 0 541.8c0-207.5 135.4-317.3 269-317.3 70.1 0 128.4 46.4 172.5 46.4 42.8 0 109.6-49 191.4-49 30.8 0 108.2 2.6 168.4 74.9zm-234.8-181.2c31.1-36.9 53.1-88.1 53.1-139.3 0-7.1-.6-14.3-1.9-20.1-50.6 1.9-110.8 33.7-147.1 75.8-28.5 32.4-55.1 83.6-55.1 135.5 0 7.8 1.3 15.6 1.9 18.1 3.2.6 8.4 1.3 13.6 1.3 45.4 0 102.5-30.4 135.5-71.3z" />
-              </svg>
-              <span>Buy with  Apple Pay</span>
-            </button>
+          <!-- Apple Pay — renderizado por PayPal SDK (solo Safari + Apple Pay configurado) -->
+          <div id="apple-pay-section" class="payment-block">
+            <div id="apple-pay-container"></div>
           </div>
 
           <!-- Separador -->
@@ -584,53 +512,6 @@ html, body {
 .btn-reset:hover {
   border-color: var(--gold);
   color: var(--gold);
-}
-
-/* ── Apple Pay button ─────────────────────────────────── */
-/* En Safari este CSS renderiza el botón nativo de Apple Pay */
-.apple-pay-btn {
-  display: block;
-  width: 100%;
-  min-height: 48px;
-  border-radius: 8px;
-  border: none;
-  cursor: pointer;
-  -webkit-appearance: -apple-pay-button;
-  -apple-pay-button-type: buy;
-  -apple-pay-button-style: black;
-}
-
-/* Fallback para Chrome/Firefox (no soportan -webkit-appearance: -apple-pay-button) */
-@supports not (-webkit-appearance: -apple-pay-button) {
-  .apple-pay-btn {
-    background: #1d1d1f;
-    color: #fff;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    font-size: 15px;
-    font-weight: 500;
-    letter-spacing: 0.02em;
-    border: 1px solid #3a3a3c;
-    transition: background 0.15s;
-  }
-  .apple-pay-btn:hover {
-    background: #2c2c2e;
-  }
-  .apple-btn-logo {
-    width: 16px;
-    height: 16px;
-  }
-}
-
-/* En Safari el contenido HTML del botón se ignora (el CSS controla todo) */
-/* Así que ocultamos el SVG y el span cuando el botón nativo está activo */
-@supports (-webkit-appearance: -apple-pay-button) {
-  .apple-btn-logo,
-  .apple-pay-btn span {
-    display: none;
-  }
 }
 
 /* ── Nota de seguridad ────────────────────────────────── */
